@@ -8,3 +8,9 @@ devenv.local.yaml
 
 # pre-commit
 .pre-commit-config.yaml
+
+# The directory Mix downloads your dependencies sources to.
+/deps/
+
+# Elixir build artifacts
+_build
