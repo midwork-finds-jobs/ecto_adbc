@@ -51,6 +51,83 @@ defmodule Ecto.Adapters.Adbc do
     String.starts_with?(to_string(database), "ducklake:")
   end
 
+  @doc false
+  def extract_ducklake_catalog_name(database_path) do
+    # Extract catalog name from path like "ducklake:/path/to/my_db.ducklake"
+    # Returns "my_db"
+    database_path
+    |> String.replace_prefix("ducklake:", "")
+    |> Path.basename(".ducklake")
+  end
+
+  @doc """
+  Creates an after_connect callback for DuckLake repositories.
+
+  This function returns a callback that:
+  - Applies DuckLake-specific configuration options from `:ducklake_options`
+
+  ## Example
+
+      defmodule MyApp.DuckLakeRepo do
+        use Ecto.Repo,
+          otp_app: :my_app,
+          adapter: Ecto.Adapters.Adbc
+
+        def init(_type, config) do
+          config = Keyword.put(config, :after_connect,
+            &Ecto.Adapters.Adbc.ducklake_after_connect(&1, config))
+          {:ok, config}
+        end
+      end
+
+  The callback can be composed with your own logic:
+
+      defmodule MyApp.DuckLakeRepo do
+        use Ecto.Repo,
+          otp_app: :my_app,
+          adapter: Ecto.Adapters.Adbc
+
+        def init(_type, config) do
+          config = Keyword.put(config, :after_connect, fn conn ->
+            # Apply DuckLake options first
+            Ecto.Adapters.Adbc.ducklake_after_connect(conn, config)
+
+            # Then your custom logic
+            load_custom_extensions(conn)
+            :ok
+          end)
+          {:ok, config}
+        end
+
+        defp load_custom_extensions(conn) do
+          # Your custom code
+        end
+      end
+  """
+  def ducklake_after_connect(conn, config) do
+    database = Keyword.get(config, :database, "")
+    ducklake_options = Keyword.get(config, :ducklake_options, [])
+
+    if String.starts_with?(to_string(database), "ducklake:") && ducklake_options != [] do
+      catalog_name = extract_ducklake_catalog_name(database)
+
+      Enum.each(ducklake_options, fn {key, value} ->
+        option_name = to_string(key)
+        option_value = to_string(value)
+
+        sql = "CALL #{catalog_name}.set_option('#{option_name}', '#{option_value}')"
+        query = %Adbcex.Query{statement: sql}
+
+        case DBConnection.execute(conn, query, [], []) do
+          {:ok, _, _} -> :ok
+          {:error, _} -> :ok  # Silently ignore errors - option may not exist
+        end
+      end)
+    end
+
+    :ok
+  end
+
   ## Adapter Callbacks
 
   @impl true
@@ -130,6 +207,9 @@ defmodule Ecto.Adapters.Adbc do
           # This will create a proper DuckDB database file
           driver = Keyword.get(opts, :driver, :duckdb)
           version = Keyword.get(opts, :version, "1.4.1")
+
+          # Ensure the driver is downloaded before attempting to use it
+          ensure_driver_downloaded(driver, version)
 
           db_opts = [driver: driver, version: version, path: database]
 
@@ -273,6 +353,77 @@ defmodule Ecto.Adapters.Adbc do
   def autogenerate(:binary_id), do: Ecto.UUID.generate()
 
   ## Private Helpers
+
+  defp ensure_driver_downloaded(driver, version) do
+    # Attempt to download the driver if it doesn't exist
+    # This will automatically detect the correct URL for the current platform
+    require Logger
+
+    # Construct the download URL for the driver
+    {os, arch} = get_platform()
+    url = build_driver_url(driver, version, os, arch)
+
+    try do
+      Logger.info("Downloading #{driver} driver version #{version} for #{os}-#{arch}...")
+      Adbc.download_driver!(driver, version: version, url: url)
+      Logger.info("Driver #{driver} version #{version} downloaded successfully")
+    rescue
+      e in RuntimeError ->
+        # If driver already exists, Adbc.download_driver! raises "already downloaded"
+        if String.contains?(e.message, "already downloaded") do
+          :ok
+        else
+          Logger.warning("Failed to download driver: #{inspect(e)}")
+          reraise e, __STACKTRACE__
+        end
+
+      e ->
+        require Logger
+        Logger.error("Unexpected error downloading driver: #{inspect(e)}")
+        reraise e, __STACKTRACE__
+    end
+  end
+
+  defp get_platform() do
+    # Detect OS and architecture
+    os = case :os.type() do
+      {:unix, :darwin} -> "osx"
+      {:unix, :linux} -> "linux"
+      {:win32, _} -> "windows"
+      _ -> raise "Unsupported OS"
+    end
+
+    arch = case :erlang.system_info(:system_architecture) |> to_string() do
+      "aarch64" <> _ -> "aarch64"
+      "arm64" <> _ -> "aarch64"
+      "x86_64" <> _ -> "amd64"
+      "i686" <> _ -> "i686"
+      _ -> raise "Unsupported architecture"
+    end
+
+    {os, arch}
+  end
+
+  defp build_driver_url(:duckdb, version, os, arch) do
+    # Map OS names to DuckDB release naming
+    os_name = case os do
+      "osx" -> "osx"
+      "linux" -> "linux"
+      "windows" -> "windows"
+    end
+
+    # Map arch names to DuckDB release naming
+    arch_name = case {os, arch} do
+      {"osx", "aarch64"} -> "universal"
+      {"osx", "amd64"} -> "universal"
+      {"linux", "aarch64"} -> "aarch64"
+      {"linux", "amd64"} -> "amd64"
+      {"windows", "amd64"} -> "amd64"
+      _ -> raise "Unsupported platform: #{os}-#{arch}"
+    end
+
+    "https://github.com/duckdb/duckdb/releases/download/v#{version}/libduckdb-#{os_name}-#{arch_name}.zip"
+  end
 
   defp run_with_cmd(database, sql, _args) do
     # For now, we'll use a simple approach - in production you might want

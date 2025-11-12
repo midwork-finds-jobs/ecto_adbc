@@ -20,6 +20,9 @@ defmodule Adbcex.Connection do
     driver = Keyword.get(opts, :driver, :duckdb)
     version = Keyword.get(opts, :version, "1.4.0")
 
+    # Ensure the driver is downloaded before attempting to use it
+    ensure_driver_downloaded(driver, version)
+
     # Start ADBC Database
     db_opts = [driver: driver, version: version]
     db_opts = if database != ":memory:", do: Keyword.put(db_opts, :path, database), else: db_opts
@@ -116,6 +119,77 @@ defmodule Adbcex.Connection do
   end
 
   # Private functions
+
+  defp ensure_driver_downloaded(driver, version) do
+    # Attempt to download the driver if it doesn't exist
+    # This will automatically detect the correct URL for the current platform
+    require Logger
+
+    # Construct the download URL for the driver
+    {os, arch} = get_platform()
+    url = build_driver_url(driver, version, os, arch)
+
+    try do
+      Logger.info("Downloading #{driver} driver version #{version} for #{os}-#{arch}...")
+      Adbc.download_driver!(driver, version: version, url: url)
+      Logger.info("Driver #{driver} version #{version} downloaded successfully")
+    rescue
+      e in RuntimeError ->
+        # If driver already exists, Adbc.download_driver! raises "already downloaded"
+        if String.contains?(e.message, "already downloaded") do
+          :ok
+        else
+          Logger.warning("Failed to download driver: #{inspect(e)}")
+          reraise e, __STACKTRACE__
+        end
+
+      e ->
+        require Logger
+        Logger.error("Unexpected error downloading driver: #{inspect(e)}")
+        reraise e, __STACKTRACE__
+    end
+  end
+
+  defp get_platform() do
+    # Detect OS and architecture
+    os = case :os.type() do
+      {:unix, :darwin} -> "osx"
+      {:unix, :linux} -> "linux"
+      {:win32, _} -> "windows"
+      _ -> raise "Unsupported OS"
+    end
+
+    arch = case :erlang.system_info(:system_architecture) |> to_string() do
+      "aarch64" <> _ -> "aarch64"
+      "arm64" <> _ -> "aarch64"
+      "x86_64" <> _ -> "amd64"
+      "i686" <> _ -> "i686"
+      _ -> raise "Unsupported architecture"
+    end
+
+    {os, arch}
+  end
+
+  defp build_driver_url(:duckdb, version, os, arch) do
+    # Map OS names to DuckDB release naming
+    os_name = case os do
+      "osx" -> "osx"
+      "linux" -> "linux"
+      "windows" -> "windows"
+    end
+
+    # Map arch names to DuckDB release naming
+    arch_name = case {os, arch} do
+      {"osx", "aarch64"} -> "universal"
+      {"osx", "amd64"} -> "universal"
+      {"linux", "aarch64"} -> "aarch64"
+      {"linux", "amd64"} -> "amd64"
+      {"windows", "amd64"} -> "amd64"
+      _ -> raise "Unsupported platform: #{os}-#{arch}"
+    end
+
+    "https://github.com/duckdb/duckdb/releases/download/v#{version}/libduckdb-#{os_name}-#{arch_name}.zip"
+  end
 
   defp exec_query(statement, params, %__MODULE__{conn: conn} = state) do
     case Adbc.Connection.query(conn, statement, params, []) do
