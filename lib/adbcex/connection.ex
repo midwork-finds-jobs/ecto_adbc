@@ -171,13 +171,6 @@ defmodule Adbcex.Connection do
   end
 
   defp build_driver_url(:duckdb, version, os, arch) do
-    # Map OS names to DuckDB release naming
-    os_name = case os do
-      "osx" -> "osx"
-      "linux" -> "linux"
-      "windows" -> "windows"
-    end
-
     # Map arch names to DuckDB release naming
     arch_name = case {os, arch} do
       {"osx", "aarch64"} -> "universal"
@@ -188,7 +181,7 @@ defmodule Adbcex.Connection do
       _ -> raise "Unsupported platform: #{os}-#{arch}"
     end
 
-    "https://github.com/duckdb/duckdb/releases/download/v#{version}/libduckdb-#{os_name}-#{arch_name}.zip"
+    "https://github.com/duckdb/duckdb/releases/download/v#{version}/libduckdb-#{os}-#{arch_name}.zip"
   end
 
   defp exec_query(statement, params, %__MODULE__{conn: conn} = state) do

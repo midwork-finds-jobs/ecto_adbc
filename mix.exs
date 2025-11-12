@@ -8,15 +8,15 @@ defmodule EctoAdbc.MixProject do
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      description: "Ecto adapter for DuckDB using ADBC",
+      description: "Ecto adapter for ADBC to use DuckDB",
       package: package()
     ]
   end
 
   defp package do
     [
-      maintainers: ["Your Name"],
-      licenses: ["Apache-2.0"],
+      maintainers: ["Onni Hakala"],
+      licenses: ["MIT"],
       links: %{}
     ]
   end
@@ -35,10 +35,8 @@ defmodule EctoAdbc.MixProject do
       {:ecto_sql, "~> 3.13"},
       {:ecto, "~> 3.13"},
       {:db_connection, "~> 2.0"},
-      {:decimal, "~> 1.6 or ~> 2.0"},
-      {:jason, "~> 1.0"},
-      {:explorer, "~> 0.11.1"},
-      {:adbc, github: "elixir-explorer/adbc", ref: "8e44fc402627dd0c4c6077c24df27cf8a97654cd", override: true}
+      {:adbc, "~> 0.8.0"},
+      {:explorer, "~> 0.11.1"}
     ]
   end
 end
