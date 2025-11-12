@@ -37,16 +37,47 @@ defmodule Ecto.Adapters.Adbc do
 
   alias Ecto.Adapters.Adbc.{Codec, Connection}
 
+  ## DuckLake Support
+
+  @doc false
+  def is_ducklake?(repo_or_config) do
+    config = if is_atom(repo_or_config) do
+      repo_or_config.config()
+    else
+      repo_or_config
+    end
+
+    database = Keyword.get(config, :database, "")
+    String.starts_with?(to_string(database), "ducklake:")
+  end
+
   ## Adapter Callbacks
 
   @impl true
   def supports_ddl_transaction?, do: true
 
   @impl true
-  def lock_for_migrations(_meta, _opts, fun) do
+  def lock_for_migrations(meta, opts, fun) do
     # DuckDB doesn't support advisory locks, so we just run the function
     # This means migrations cannot be run concurrently
-    fun.()
+
+    # Check if THIS specific repo is using DuckLake and store in Process dictionary
+    # This allows Connection.execute_ddl to know if it should strip PRIMARY KEY
+    config = if meta.repo do
+      meta.repo.config()
+    else
+      Keyword.merge(meta.opts, opts)
+    end
+
+    if is_ducklake?(config) do
+      Process.put(:ecto_adbc_ducklake_mode, true)
+    end
+
+    try do
+      fun.()
+    after
+      Process.delete(:ecto_adbc_ducklake_mode)
+    end
   end
 
   # Creates DuckLake metadata schemas during storage_up
@@ -69,7 +100,7 @@ defmodule Ecto.Adapters.Adbc do
         # INSTALL ducklake;
         # ATTACH 'ducklake:sample_phoenix_ducklake_setup.duckdb' AS my_ducklake;
 
-        Duckex.query!(conn, create_schema_sql)
+        Connection.query(conn, create_schema_sql, [], [])
       end
     end)
   end
@@ -79,12 +110,13 @@ defmodule Ecto.Adapters.Adbc do
   @impl true
   def storage_up(opts) do
     database = Keyword.fetch!(opts, :database)
-    pool_size = Keyword.get(options, :pool_size, 1)
+    pool_size = Keyword.get(opts, :pool_size, 1)
 
-    pool_size != 1 ->
+    if pool_size != 1 do
       raise ArgumentError, """
         DuckDB databases must use a pool_size of 1
       """
+    end
 
     if database == ":memory:" do
       {:error, :already_up}
@@ -106,7 +138,7 @@ defmodule Ecto.Adapters.Adbc do
               case Adbc.Connection.start_link(database: db) do
                 {:ok, conn} ->
                   # Create DuckLake metadata databases if this repo uses DuckLake
-                  create_ducklake_metadata_databases(conn, options)
+                  create_ducklake_metadata_databases(conn, opts)
 
                   GenServer.stop(conn)
                   GenServer.stop(db)

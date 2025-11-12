@@ -284,7 +284,15 @@ defmodule Ecto.Adapters.Adbc.Connection do
       options_expr(table.options)
     ]
 
-    sequences ++ [table_query]
+    # Post-process SQL to strip PRIMARY KEY for DuckLake tables
+    # DuckLake doesn't support PRIMARY KEY constraints
+    all_queries = sequences ++ [table_query]
+
+    if should_strip_primary_key?(table) do
+      Enum.map(all_queries, &strip_primary_key_from_sql/1)
+    else
+      all_queries
+    end
   end
 
   def execute_ddl({:drop, %Table{} = table, mode}) do
@@ -313,6 +321,23 @@ defmodule Ecto.Adapters.Adbc.Connection do
     end)
   end
 
+  def execute_ddl({:create, %Index{prefix: prefix} = index}) when not is_nil(prefix) do
+    raise ArgumentError, """
+    Creating indexes on tables with a prefix (schema) is not supported.
+
+    If you are using DuckLake (attached databases), note that DuckLake does not support indexes.
+    DuckLake uses columnar Parquet storage which provides efficient filtering without traditional indexes.
+
+    Table prefix: #{inspect(prefix)}
+    Index name: #{inspect(index.name)}
+    Table name: #{inspect(index.table)}
+
+    If you need to create an index on a regular DuckDB table (not DuckLake), consider:
+    1. Moving the table to the main database (no prefix)
+    2. Using filtered queries instead of indexes for better performance with columnar storage
+    """
+  end
+
   def execute_ddl({:create, %Index{} = index}) do
     fields = Enum.map_intersperse(index.columns, ", ", &index_expr/1)
 
@@ -336,9 +361,39 @@ defmodule Ecto.Adapters.Adbc.Connection do
     queries
   end
 
+  def execute_ddl({:create_if_not_exists, %Index{prefix: prefix} = index}) when not is_nil(prefix) do
+    raise ArgumentError, """
+    Creating indexes on tables with a prefix (schema) is not supported.
+
+    If you are using DuckLake (attached databases), note that DuckLake does not support indexes.
+    DuckLake uses columnar Parquet storage which provides efficient filtering without traditional indexes.
+
+    Table prefix: #{inspect(prefix)}
+    Index name: #{inspect(index.name)}
+    Table name: #{inspect(index.table)}
+
+    If you need to create an index on a regular DuckDB table (not DuckLake), consider:
+    1. Moving the table to the main database (no prefix)
+    2. Using filtered queries instead of indexes for better performance with columnar storage
+    """
+  end
+
   def execute_ddl({:create_if_not_exists, %Index{} = index}) do
     # DuckDB doesn't support IF NOT EXISTS for indexes, just create it
     execute_ddl({:create, index})
+  end
+
+  def execute_ddl({:drop, %Index{prefix: prefix} = index, _mode}) when not is_nil(prefix) do
+    raise ArgumentError, """
+    Dropping indexes on tables with a prefix (schema) is not supported.
+
+    DuckLake does not support indexes. If you're trying to drop an index on a DuckLake table,
+    you can safely remove the drop index statement from your migration as DuckLake tables
+    never have indexes to begin with.
+
+    Table prefix: #{inspect(prefix)}
+    Index name: #{inspect(index.name)}
+    """
   end
 
   def execute_ddl({:drop, %Index{} = index, mode}) do
@@ -350,6 +405,19 @@ defmodule Ecto.Adapters.Adbc.Connection do
         quote_table(index.prefix, index.name)
       ]
     ]
+  end
+
+  def execute_ddl({:drop_if_exists, %Index{prefix: prefix} = index, _mode}) when not is_nil(prefix) do
+    raise ArgumentError, """
+    Dropping indexes on tables with a prefix (schema) is not supported.
+
+    DuckLake does not support indexes. If you're trying to drop an index on a DuckLake table,
+    you can safely remove the drop index statement from your migration as DuckLake tables
+    never have indexes to begin with.
+
+    Table prefix: #{inspect(prefix)}
+    Index name: #{inspect(index.name)}
+    """
   end
 
   def execute_ddl({:drop_if_exists, %Index{} = index, mode}) do
@@ -449,7 +517,11 @@ defmodule Ecto.Adapters.Adbc.Connection do
   defp column_options(table, name, type, opts) do
     default = Keyword.fetch(opts, :default)
     null = Keyword.get(opts, :null)
-    pk = Keyword.get(opts, :primary_key)
+
+    # Skip PRIMARY KEY constraint if table.primary_key is false (for DuckLake)
+    # or if it's a composite primary key (handled separately)
+    # This must be checked before looking at the column's primary_key option
+    pk = table.primary_key not in [:composite, false] and Keyword.get(opts, :primary_key, false)
 
     # For serial types with primary key and no explicit default, use sequence
     auto_increment = type in [:id, :serial, :bigserial] && pk && default == :error
@@ -988,4 +1060,62 @@ defmodule Ecto.Adapters.Adbc.Connection do
   defp error!(query, message) do
     raise Ecto.QueryError, query: query, message: message
   end
+
+  # DuckLake support: strip PRIMARY KEY constraints
+  # DuckLake doesn't support PRIMARY KEY or UNIQUE constraints
+  # This is done when:
+  # 1. migration_primary_key: false is explicitly set (table.primary_key = false)
+  # 2. The current repo is using DuckLake (detected via Process dictionary set by lock_for_migrations)
+
+  defp should_strip_primary_key?(%Table{primary_key: false}), do: true
+  defp should_strip_primary_key?(table) do
+    # First check if lock_for_migrations has set the flag (during actual migrations)
+    case Process.get(:ecto_adbc_ducklake_mode) do
+      true ->
+        true
+
+      _ ->
+        # Fallback: Check if we're creating schema_migrations for a DuckLake repo
+        # by checking Application environment for repos using this adapter
+        if table.name == :schema_migrations do
+          has_any_ducklake_repo?()
+        else
+          false
+        end
+    end
+  end
+
+  defp has_any_ducklake_repo?() do
+    # Check all loaded applications for Ecto repos with DuckLake databases
+    Application.loaded_applications()
+    |> Enum.any?(fn {app, _, _} ->
+      Application.get_all_env(app)
+      |> Enum.any?(fn
+        {_key, config} when is_list(config) ->
+          case Keyword.get(config, :database) do
+            database when is_binary(database) ->
+              String.starts_with?(database, "ducklake:")
+            _ ->
+              false
+          end
+
+        _ ->
+          false
+      end)
+    end)
+  end
+
+  defp strip_primary_key_from_sql(sql) when is_binary(sql) do
+    sql
+    |> String.replace(~r/\s+PRIMARY KEY/i, " NOT NULL")
+    |> String.replace(~r/,\s*PRIMARY KEY\s*\([^)]+\)/i, "")
+  end
+
+  defp strip_primary_key_from_sql(sql) when is_list(sql) do
+    sql
+    |> IO.iodata_to_binary()
+    |> strip_primary_key_from_sql()
+  end
+
+  defp strip_primary_key_from_sql(sql), do: sql
 end
