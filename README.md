@@ -20,9 +20,9 @@ Add `ecto_adbc` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:ecto_adbc, path: "../ecto_adbc"},
+    {:ecto_adbc, github: "midwork-finds-jobs/ecto_adbc"},
     {:ecto_sql, "~> 3.0"},
-    {:jason, "~> 1.0"}  # JSON library
+    {:jason, "~> 1.0"}
   ]
 end
 ```
