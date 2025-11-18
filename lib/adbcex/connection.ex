@@ -29,14 +29,18 @@ defmodule Adbcex.Connection do
     Logger.info("Adbcex.Connection.connect - version: #{inspect(version)}")
     Logger.info("Adbcex.Connection.connect - driver is_binary?: #{inspect(is_binary(driver))}")
 
-    # Ensure the driver is downloaded before attempting to use it
-    # Skip download if driver is a string (path) - assume it's already available
-    unless is_binary(driver) do
-      ensure_driver_downloaded(driver, version)
+    # If driver is an atom, get the path to the installed driver (installing if needed)
+    # If driver is already a string (path), use it directly
+    driver_path = if is_binary(driver) do
+      driver
+    else
+      ensure_driver_installed(driver, version)
     end
 
-    # Start ADBC Database
-    db_opts = [driver: driver, version: version]
+    Logger.info("Adbcex.Connection.connect - driver_path: #{inspect(driver_path)}")
+
+    # Start ADBC Database with driver path
+    db_opts = [driver: driver_path]
     db_opts = if database != ":memory:", do: Keyword.put(db_opts, :path, database), else: db_opts
 
     Logger.info("Adbcex.Connection.connect - db_opts being passed to Adbc.Database.start_link: #{inspect(db_opts)}")
@@ -134,33 +138,127 @@ defmodule Adbcex.Connection do
 
   # Private functions
 
-  defp ensure_driver_downloaded(driver, version) do
-    # Attempt to download the driver if it doesn't exist
-    # This will automatically detect the correct URL for the current platform
+  defp ensure_driver_installed(driver, version) do
+    # Install driver to a writable directory and return its path
     require Logger
 
-    # Construct the download URL for the driver
+    # Get writable installation directory
+    install_dir = get_install_dir()
+    Logger.info("Using installation directory: #{inspect(install_dir)}")
+
+    # Get platform info
     {os, arch} = get_platform()
-    url = build_driver_url(driver, version, os, arch)
 
-    try do
-      Logger.info("Downloading #{driver} driver version #{version} for #{os}-#{arch}...")
-      Adbc.download_driver!(driver, version: version, url: url)
-      Logger.info("Driver #{driver} version #{version} downloaded successfully")
-    rescue
-      e in RuntimeError ->
-        # If driver already exists, Adbc.download_driver! raises "already downloaded"
-        if String.contains?(e.message, "already downloaded") do
-          :ok
-        else
-          Logger.warning("Failed to download driver: #{inspect(e)}")
-          reraise e, __STACKTRACE__
-        end
+    # Determine driver filename based on platform
+    driver_filename = case os do
+      "windows" -> "adbc_driver_#{driver}.dll"
+      "osx" -> "libadbc_driver_#{driver}.dylib"
+      _ -> "libadbc_driver_#{driver}.so"
+    end
 
-      e ->
-        require Logger
-        Logger.error("Unexpected error downloading driver: #{inspect(e)}")
-        reraise e, __STACKTRACE__
+    driver_path = Path.join(install_dir, driver_filename)
+
+    # Check if driver already exists
+    if File.exists?(driver_path) do
+      Logger.info("Driver already installed at #{driver_path}")
+      driver_path
+    else
+      Logger.info("Installing #{driver} driver version #{version} for #{os}-#{arch}...")
+
+      # Download the driver archive
+      url = build_driver_url(driver, version, os, arch)
+      Logger.info("Downloading from: #{url}")
+
+      # Use Adbc's download mechanism but to our cache directory
+      cache_dir = get_cache_dir()
+      File.mkdir_p!(cache_dir)
+
+      cache_file = Path.join(cache_dir, "#{driver}-#{version}-#{os}-#{arch}.zip")
+
+      unless File.exists?(cache_file) do
+        Logger.info("Downloading to cache: #{cache_file}")
+        download_file(url, cache_file)
+      else
+        Logger.info("Using cached file: #{cache_file}")
+      end
+
+      # Extract the driver to installation directory
+      File.mkdir_p!(install_dir)
+      extract_driver(cache_file, install_dir, driver_filename)
+
+      Logger.info("Driver installed successfully at #{driver_path}")
+      driver_path
+    end
+  end
+
+  defp get_install_dir do
+    # Use ADBC_CACHE_DIR if set, otherwise fall back to HOME/.cache/adbc
+    base_dir = System.get_env("ADBC_CACHE_DIR") ||
+               Path.join(System.get_env("HOME") || "/tmp", ".cache/adbc")
+    Path.join(base_dir, "drivers")
+  end
+
+  defp get_cache_dir do
+    # Separate cache directory for downloaded archives
+    base_dir = System.get_env("ADBC_CACHE_DIR") ||
+               Path.join(System.get_env("HOME") || "/tmp", ".cache/adbc")
+    Path.join(base_dir, "downloads")
+  end
+
+  defp download_file(url, dest_path) do
+    require Logger
+
+    # Use :httpc to download the file
+    :inets.start()
+    :ssl.start()
+
+    url_charlist = String.to_charlist(url)
+
+    case :httpc.request(:get, {url_charlist, []}, [{:timeout, 60000}], [body_format: :binary]) do
+      {:ok, {{_, 200, _}, _headers, body}} ->
+        File.write!(dest_path, body)
+        Logger.info("Downloaded #{byte_size(body)} bytes")
+        :ok
+
+      {:ok, {{_, status, _}, _headers, _body}} ->
+        raise "HTTP request failed with status #{status}"
+
+      {:error, reason} ->
+        raise "HTTP request failed: #{inspect(reason)}"
+    end
+  end
+
+  defp extract_driver(zip_file, dest_dir, driver_filename) do
+    require Logger
+
+    # Unzip the archive
+    {:ok, files} = :zip.unzip(String.to_charlist(zip_file),
+                               cwd: String.to_charlist(dest_dir))
+
+    Logger.info("Extracted files: #{inspect(files)}")
+
+    # Find the driver library in extracted files
+    driver_file = Enum.find(files, fn file ->
+      file_str = to_string(file)
+      String.ends_with?(file_str, driver_filename) or
+      String.ends_with?(file_str, ".so") or
+      String.ends_with?(file_str, ".dylib") or
+      String.ends_with?(file_str, ".dll")
+    end)
+
+    if driver_file do
+      # Move/rename to expected location if needed
+      extracted_path = to_string(driver_file)
+      expected_path = Path.join(dest_dir, driver_filename)
+
+      unless extracted_path == expected_path do
+        File.rename!(extracted_path, expected_path)
+        Logger.info("Renamed #{extracted_path} to #{expected_path}")
+      end
+
+      :ok
+    else
+      raise "Could not find driver library in extracted files"
     end
   end
 
