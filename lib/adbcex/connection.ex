@@ -21,7 +21,10 @@ defmodule Adbcex.Connection do
     version = Keyword.get(opts, :version, Ecto.Adapters.Adbc.default_duckdb_version())
 
     # Ensure the driver is downloaded before attempting to use it
-    ensure_driver_downloaded(driver, version)
+    # Skip download if driver is a string (path) - assume it's already available
+    unless is_binary(driver) do
+      ensure_driver_downloaded(driver, version)
+    end
 
     # Start ADBC Database
     db_opts = [driver: driver, version: version]
