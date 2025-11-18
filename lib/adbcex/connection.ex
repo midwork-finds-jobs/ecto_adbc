@@ -151,10 +151,11 @@ defmodule Adbcex.Connection do
     {os, arch} = get_platform()
 
     # Determine driver filename based on platform
+    # For DuckDB, ADBC uses the libduckdb library directly
     driver_filename = case os do
-      "windows" -> "adbc_driver_#{driver}.dll"
-      "osx" -> "libadbc_driver_#{driver}.dylib"
-      _ -> "libadbc_driver_#{driver}.so"
+      "windows" -> "lib#{driver}.dll"
+      "osx" -> "lib#{driver}.dylib"
+      _ -> "lib#{driver}.so"
     end
 
     driver_path = Path.join(install_dir, driver_filename)
@@ -205,7 +206,7 @@ defmodule Adbcex.Connection do
     cache_dir = get_cache_dir()
     File.mkdir_p!(cache_dir)
 
-    cache_file = Path.join(cache_dir, "#{driver}-#{version}-#{os}-#{arch}.tar.gz")
+    cache_file = Path.join(cache_dir, "#{driver}-#{version}-#{os}-#{arch}.zip")
 
     unless File.exists?(cache_file) do
       Logger.info("Downloading to cache: #{cache_file}")
@@ -289,46 +290,47 @@ defmodule Adbcex.Connection do
     end
   end
 
-  defp extract_driver(archive_file, dest_dir, driver_filename) do
+  defp extract_driver(zip_file, dest_dir, driver_filename) do
     require Logger
 
-    # Extract tar.gz archive using system tar command
-    # This is more reliable than using Erlang's :erl_tar
-    System.cmd("tar", ["-xzf", archive_file, "-C", dest_dir],
-      stderr_to_stdout: true)
-    |> case do
-      {output, 0} ->
-        Logger.info("Extracted archive: #{output}")
-
-        # List all extracted files
-        {:ok, files} = File.ls(dest_dir)
+    # Unzip the archive
+    case :zip.unzip(String.to_charlist(zip_file), cwd: String.to_charlist(dest_dir)) do
+      {:ok, files} ->
         Logger.info("Extracted files: #{inspect(files)}")
 
-        # Find the driver library in extracted files
-        driver_file = Enum.find(files, fn file ->
-          String.ends_with?(file, driver_filename) or
-          String.ends_with?(file, ".so") or
-          String.ends_with?(file, ".dylib") or
-          String.ends_with?(file, ".dll")
-        end)
+        # The driver file should already have the correct name (libduckdb.so)
+        # Just verify it exists
+        expected_path = Path.join(dest_dir, driver_filename)
 
-        if driver_file do
-          # Move/rename to expected location if needed
-          extracted_path = Path.join(dest_dir, driver_file)
-          expected_path = Path.join(dest_dir, driver_filename)
-
-          unless extracted_path == expected_path do
-            File.rename!(extracted_path, expected_path)
-            Logger.info("Renamed #{driver_file} to #{driver_filename}")
-          end
-
+        if File.exists?(expected_path) do
+          Logger.info("Driver extracted successfully: #{expected_path}")
           :ok
         else
-          raise "Could not find driver library in extracted files: #{inspect(files)}"
+          # Try to find the library file in case the name is different
+          driver_file = Enum.find(files, fn file ->
+            file_str = to_string(file)
+            String.ends_with?(file_str, ".so") or
+            String.ends_with?(file_str, ".dylib") or
+            String.ends_with?(file_str, ".dll")
+          end)
+
+          if driver_file do
+            extracted_path = to_string(driver_file)
+
+            # Only rename if different from expected
+            unless extracted_path == expected_path do
+              File.rename!(extracted_path, expected_path)
+              Logger.info("Renamed #{extracted_path} to #{expected_path}")
+            end
+
+            :ok
+          else
+            raise "Could not find driver library in extracted files: #{inspect(files)}"
+          end
         end
 
-      {output, exit_code} ->
-        raise "Failed to extract archive (exit code #{exit_code}): #{output}"
+      {:error, reason} ->
+        raise "Failed to extract zip archive: #{inspect(reason)}"
     end
   end
 
@@ -353,27 +355,19 @@ defmodule Adbcex.Connection do
   end
 
   defp build_driver_url(:duckdb, version, os, arch) do
-    # ADBC drivers are released by Apache Arrow ADBC project
-    # The DuckDB ADBC driver version corresponds to ADBC version, not DuckDB version
-    # For now, we'll use a mapping or default to a known working version
-    # TODO: Make this configurable or fetch the latest ADBC release version
-
-    # Map DuckDB version to ADBC version (this is approximate)
-    # For DuckDB 1.4.x, we should use ADBC 0.8.0 or later
-    adbc_version = "0.8.0"
-
-    # Map arch names to ADBC release naming
-    {os_name, arch_name} = case {os, arch} do
-      {"osx", "aarch64"} -> {"macos", "arm64"}
-      {"osx", "amd64"} -> {"macos", "x86_64"}
-      {"linux", "aarch64"} -> {"linux", "arm64"}
-      {"linux", "amd64"} -> {"linux", "x86_64"}
-      {"windows", "amd64"} -> {"windows", "amd64"}
+    # DuckDB releases contain libduckdb which ADBC can use directly
+    # Map arch names to DuckDB release naming
+    arch_name = case {os, arch} do
+      {"osx", "aarch64"} -> "universal"
+      {"osx", "amd64"} -> "universal"
+      {"linux", "aarch64"} -> "arm64"
+      {"linux", "amd64"} -> "amd64"
+      {"windows", "amd64"} -> "amd64"
       _ -> raise "Unsupported platform: #{os}-#{arch}"
     end
 
-    # Apache Arrow ADBC releases the drivers as tar.gz files
-    "https://github.com/apache/arrow-adbc/releases/download/apache-arrow-adbc-#{adbc_version}/adbc_driver_duckdb-#{adbc_version}-#{os_name}-#{arch_name}.tar.gz"
+    # DuckDB releases use zip format
+    "https://github.com/duckdb/duckdb/releases/download/v#{version}/libduckdb-#{os}-#{arch_name}.zip"
   end
 
   defp exec_query(statement, params, %__MODULE__{conn: conn} = state) do
