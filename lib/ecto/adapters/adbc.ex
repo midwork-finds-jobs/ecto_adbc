@@ -1,4 +1,7 @@
 defmodule Ecto.Adapters.Adbc do
+  # Define version before @moduledoc so it can be interpolated
+  @default_duckdb_version "1.4.2"
+
   @moduledoc """
   Ecto adapter for DuckDB using ADBC.
 
@@ -36,8 +39,6 @@ defmodule Ecto.Adapters.Adbc do
   @behaviour Ecto.Adapter.Structure
 
   alias Ecto.Adapters.Adbc.{Codec, Connection}
-
-  @default_duckdb_version "1.4.2"
 
   @doc false
   def default_duckdb_version, do: @default_duckdb_version
