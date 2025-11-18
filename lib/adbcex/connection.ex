@@ -143,12 +143,8 @@ defmodule Adbcex.Connection do
     # Use a lock file to prevent race conditions when multiple processes try to install
     require Logger
 
-    # Get writable installation directory
-    install_dir = get_install_dir()
-    Logger.info("Using installation directory: #{inspect(install_dir)}")
-
     # Get platform info
-    {os, arch} = get_platform()
+    {os, _arch} = get_platform()
 
     # Determine driver filename based on platform
     # For DuckDB, ADBC uses the libduckdb library directly
@@ -158,38 +154,65 @@ defmodule Adbcex.Connection do
       _ -> "lib#{driver}.so"
     end
 
-    driver_path = Path.join(install_dir, driver_filename)
+    # First, check if driver is pre-installed in the ADBC library priv directory
+    # This is preferred for NixOS deployments where the driver is patched during build
+    priv_driver_path = check_priv_driver(driver_filename)
 
-    # Check if driver already exists
-    if File.exists?(driver_path) do
-      Logger.info("Driver already installed at #{driver_path}")
-      driver_path
+    if priv_driver_path do
+      Logger.info("Using pre-installed driver at #{priv_driver_path}")
+      priv_driver_path
     else
-      # Use lock file to prevent concurrent installations
-      lock_file = Path.join(install_dir, ".#{driver}-#{version}.lock")
-      File.mkdir_p!(install_dir)
+      # Fall back to downloading and installing to writable directory
+      install_dir = get_install_dir()
+      Logger.info("Using installation directory: #{inspect(install_dir)}")
 
-      # Try to acquire lock
-      case File.open(lock_file, [:write, :exclusive]) do
-        {:ok, lock_fd} ->
-          try do
-            # Double-check after acquiring lock
-            if File.exists?(driver_path) do
-              Logger.info("Driver already installed (found after lock acquisition)")
-              driver_path
-            else
-              do_install_driver(driver, version, os, arch, install_dir, driver_path, driver_filename)
+      {os, arch} = get_platform()
+      driver_path = Path.join(install_dir, driver_filename)
+
+      # Check if driver already exists
+      if File.exists?(driver_path) do
+        Logger.info("Driver already installed at #{driver_path}")
+        driver_path
+      else
+        # Use lock file to prevent concurrent installations
+        lock_file = Path.join(install_dir, ".#{driver}-#{version}.lock")
+        File.mkdir_p!(install_dir)
+
+        # Try to acquire lock
+        case File.open(lock_file, [:write, :exclusive]) do
+          {:ok, lock_fd} ->
+            try do
+              # Double-check after acquiring lock
+              if File.exists?(driver_path) do
+                Logger.info("Driver already installed (found after lock acquisition)")
+                driver_path
+              else
+                do_install_driver(driver, version, os, arch, install_dir, driver_path, driver_filename)
+              end
+            after
+              File.close(lock_fd)
+              File.rm(lock_file)
             end
-          after
-            File.close(lock_fd)
-            File.rm(lock_file)
-          end
 
-        {:error, :eexist} ->
-          # Another process is installing, wait for it
-          Logger.info("Waiting for another process to finish installing driver...")
-          wait_for_driver(driver_path, 30_000)
+          {:error, :eexist} ->
+            # Another process is installing, wait for it
+            Logger.info("Waiting for another process to finish installing driver...")
+            wait_for_driver(driver_path, 30_000)
+        end
       end
+    end
+  end
+
+  defp check_priv_driver(driver_filename) do
+    # Check if driver exists in ADBC library's priv/drivers directory
+    # This is where NixOS builds pre-install the driver
+    adbc_priv_dir = Application.app_dir(:adbc, "priv")
+    priv_driver_path = Path.join([adbc_priv_dir, "drivers", driver_filename])
+
+    if File.exists?(priv_driver_path) do
+      priv_driver_path
+    else
+      nil
     end
   end
 
