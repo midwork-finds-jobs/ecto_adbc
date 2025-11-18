@@ -140,6 +140,7 @@ defmodule Adbcex.Connection do
 
   defp ensure_driver_installed(driver, version) do
     # Install driver to a writable directory and return its path
+    # Use a lock file to prevent race conditions when multiple processes try to install
     require Logger
 
     # Get writable installation directory
@@ -163,31 +164,91 @@ defmodule Adbcex.Connection do
       Logger.info("Driver already installed at #{driver_path}")
       driver_path
     else
-      Logger.info("Installing #{driver} driver version #{version} for #{os}-#{arch}...")
-
-      # Download the driver archive
-      url = build_driver_url(driver, version, os, arch)
-      Logger.info("Downloading from: #{url}")
-
-      # Use Adbc's download mechanism but to our cache directory
-      cache_dir = get_cache_dir()
-      File.mkdir_p!(cache_dir)
-
-      cache_file = Path.join(cache_dir, "#{driver}-#{version}-#{os}-#{arch}.zip")
-
-      unless File.exists?(cache_file) do
-        Logger.info("Downloading to cache: #{cache_file}")
-        download_file(url, cache_file)
-      else
-        Logger.info("Using cached file: #{cache_file}")
-      end
-
-      # Extract the driver to installation directory
+      # Use lock file to prevent concurrent installations
+      lock_file = Path.join(install_dir, ".#{driver}-#{version}.lock")
       File.mkdir_p!(install_dir)
-      extract_driver(cache_file, install_dir, driver_filename)
 
-      Logger.info("Driver installed successfully at #{driver_path}")
-      driver_path
+      # Try to acquire lock
+      case File.open(lock_file, [:write, :exclusive]) do
+        {:ok, lock_fd} ->
+          try do
+            # Double-check after acquiring lock
+            if File.exists?(driver_path) do
+              Logger.info("Driver already installed (found after lock acquisition)")
+              driver_path
+            else
+              do_install_driver(driver, version, os, arch, install_dir, driver_path, driver_filename)
+            end
+          after
+            File.close(lock_fd)
+            File.rm(lock_file)
+          end
+
+        {:error, :eexist} ->
+          # Another process is installing, wait for it
+          Logger.info("Waiting for another process to finish installing driver...")
+          wait_for_driver(driver_path, 30_000)
+      end
+    end
+  end
+
+  defp do_install_driver(driver, version, os, arch, install_dir, driver_path, driver_filename) do
+    require Logger
+
+    Logger.info("Installing #{driver} driver version #{version} for #{os}-#{arch}...")
+
+    # Download the driver archive
+    url = build_driver_url(driver, version, os, arch)
+    Logger.info("Downloading from: #{url}")
+
+    # Use Adbc's download mechanism but to our cache directory
+    cache_dir = get_cache_dir()
+    File.mkdir_p!(cache_dir)
+
+    cache_file = Path.join(cache_dir, "#{driver}-#{version}-#{os}-#{arch}.tar.gz")
+
+    unless File.exists?(cache_file) do
+      Logger.info("Downloading to cache: #{cache_file}")
+      download_file(url, cache_file)
+    else
+      Logger.info("Using cached file: #{cache_file}")
+    end
+
+    # Extract the driver to installation directory
+    extract_driver(cache_file, install_dir, driver_filename)
+
+    Logger.info("Driver installed successfully at #{driver_path}")
+    driver_path
+  end
+
+  defp wait_for_driver(driver_path, timeout) do
+    require Logger
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    Stream.repeatedly(fn ->
+      if File.exists?(driver_path) do
+        {:ok, driver_path}
+      else
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(100)
+          :continue
+        else
+          {:error, :timeout}
+        end
+      end
+    end)
+    |> Enum.find(fn
+      {:ok, _} -> true
+      {:error, _} -> true
+      :continue -> false
+    end)
+    |> case do
+      {:ok, path} ->
+        Logger.info("Driver installation completed by another process")
+        path
+
+      {:error, :timeout} ->
+        raise "Timeout waiting for driver installation"
     end
   end
 
@@ -228,37 +289,46 @@ defmodule Adbcex.Connection do
     end
   end
 
-  defp extract_driver(zip_file, dest_dir, driver_filename) do
+  defp extract_driver(archive_file, dest_dir, driver_filename) do
     require Logger
 
-    # Unzip the archive
-    {:ok, files} = :zip.unzip(String.to_charlist(zip_file),
-                               cwd: String.to_charlist(dest_dir))
+    # Extract tar.gz archive using system tar command
+    # This is more reliable than using Erlang's :erl_tar
+    System.cmd("tar", ["-xzf", archive_file, "-C", dest_dir],
+      stderr_to_stdout: true)
+    |> case do
+      {output, 0} ->
+        Logger.info("Extracted archive: #{output}")
 
-    Logger.info("Extracted files: #{inspect(files)}")
+        # List all extracted files
+        {:ok, files} = File.ls(dest_dir)
+        Logger.info("Extracted files: #{inspect(files)}")
 
-    # Find the driver library in extracted files
-    driver_file = Enum.find(files, fn file ->
-      file_str = to_string(file)
-      String.ends_with?(file_str, driver_filename) or
-      String.ends_with?(file_str, ".so") or
-      String.ends_with?(file_str, ".dylib") or
-      String.ends_with?(file_str, ".dll")
-    end)
+        # Find the driver library in extracted files
+        driver_file = Enum.find(files, fn file ->
+          String.ends_with?(file, driver_filename) or
+          String.ends_with?(file, ".so") or
+          String.ends_with?(file, ".dylib") or
+          String.ends_with?(file, ".dll")
+        end)
 
-    if driver_file do
-      # Move/rename to expected location if needed
-      extracted_path = to_string(driver_file)
-      expected_path = Path.join(dest_dir, driver_filename)
+        if driver_file do
+          # Move/rename to expected location if needed
+          extracted_path = Path.join(dest_dir, driver_file)
+          expected_path = Path.join(dest_dir, driver_filename)
 
-      unless extracted_path == expected_path do
-        File.rename!(extracted_path, expected_path)
-        Logger.info("Renamed #{extracted_path} to #{expected_path}")
-      end
+          unless extracted_path == expected_path do
+            File.rename!(extracted_path, expected_path)
+            Logger.info("Renamed #{driver_file} to #{driver_filename}")
+          end
 
-      :ok
-    else
-      raise "Could not find driver library in extracted files"
+          :ok
+        else
+          raise "Could not find driver library in extracted files: #{inspect(files)}"
+        end
+
+      {output, exit_code} ->
+        raise "Failed to extract archive (exit code #{exit_code}): #{output}"
     end
   end
 
@@ -283,17 +353,27 @@ defmodule Adbcex.Connection do
   end
 
   defp build_driver_url(:duckdb, version, os, arch) do
-    # Map arch names to DuckDB release naming
-    arch_name = case {os, arch} do
-      {"osx", "aarch64"} -> "universal"
-      {"osx", "amd64"} -> "universal"
-      {"linux", "aarch64"} -> "aarch64"
-      {"linux", "amd64"} -> "amd64"
-      {"windows", "amd64"} -> "amd64"
+    # ADBC drivers are released by Apache Arrow ADBC project
+    # The DuckDB ADBC driver version corresponds to ADBC version, not DuckDB version
+    # For now, we'll use a mapping or default to a known working version
+    # TODO: Make this configurable or fetch the latest ADBC release version
+
+    # Map DuckDB version to ADBC version (this is approximate)
+    # For DuckDB 1.4.x, we should use ADBC 0.8.0 or later
+    adbc_version = "0.8.0"
+
+    # Map arch names to ADBC release naming
+    {os_name, arch_name} = case {os, arch} do
+      {"osx", "aarch64"} -> {"macos", "arm64"}
+      {"osx", "amd64"} -> {"macos", "x86_64"}
+      {"linux", "aarch64"} -> {"linux", "arm64"}
+      {"linux", "amd64"} -> {"linux", "x86_64"}
+      {"windows", "amd64"} -> {"windows", "amd64"}
       _ -> raise "Unsupported platform: #{os}-#{arch}"
     end
 
-    "https://github.com/duckdb/duckdb/releases/download/v#{version}/libduckdb-#{os}-#{arch_name}.zip"
+    # Apache Arrow ADBC releases the drivers as tar.gz files
+    "https://github.com/apache/arrow-adbc/releases/download/apache-arrow-adbc-#{adbc_version}/adbc_driver_duckdb-#{adbc_version}-#{os_name}-#{arch_name}.tar.gz"
   end
 
   defp exec_query(statement, params, %__MODULE__{conn: conn} = state) do
