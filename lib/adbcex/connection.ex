@@ -29,18 +29,25 @@ defmodule Adbcex.Connection do
     Logger.info("Adbcex.Connection.connect - version: #{inspect(version)}")
     Logger.info("Adbcex.Connection.connect - driver is_binary?: #{inspect(is_binary(driver))}")
 
-    # If driver is an atom, get the path to the installed driver (installing if needed)
-    # If driver is already a string (path), use it directly
-    driver_path = if is_binary(driver) do
-      driver
+    # Get driver path and determine if we need custom entrypoint
+    {driver_to_use, extra_opts} = if is_binary(driver) do
+      {driver, []}
     else
-      ensure_driver_installed(driver, version)
+      driver_path = ensure_driver_installed(driver, version)
+      Logger.info("Driver installed at #{driver_path}, will use path with entrypoint")
+
+      # For DuckDB, we need to specify the entrypoint when using a path
+      # because ADBC looks for AdbcDriverInit by default, but DuckDB uses duckdb_adbc_init
+      entrypoint_opts = case driver do
+        :duckdb -> [entrypoint: "duckdb_adbc_init"]
+        _ -> []
+      end
+
+      {driver_path, entrypoint_opts}
     end
 
-    Logger.info("Adbcex.Connection.connect - driver_path: #{inspect(driver_path)}")
-
-    # Start ADBC Database with driver path
-    db_opts = [driver: driver_path]
+    # Start ADBC Database with driver (path or atom) and options
+    db_opts = [driver: driver_to_use] ++ extra_opts
     db_opts = if database != ":memory:", do: Keyword.put(db_opts, :path, database), else: db_opts
 
     Logger.info("Adbcex.Connection.connect - db_opts being passed to Adbc.Database.start_link: #{inspect(db_opts)}")
