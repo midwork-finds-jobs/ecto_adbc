@@ -18,6 +18,8 @@ defmodule Adbcex.Connection do
   def connect(opts) do
     require Logger
 
+    Logger.info("Adbcex.Connection.connect - RAW OPTS: #{inspect(opts)}")
+
     database = Keyword.get(opts, :database, ":memory:")
     driver = Keyword.get(opts, :driver, :duckdb)
     version = Keyword.get(opts, :version, Ecto.Adapters.Adbc.default_duckdb_version())
