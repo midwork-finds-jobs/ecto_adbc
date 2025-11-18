@@ -18,7 +18,7 @@ defmodule Adbcex.Connection do
   def connect(opts) do
     database = Keyword.get(opts, :database, ":memory:")
     driver = Keyword.get(opts, :driver, :duckdb)
-    version = Keyword.get(opts, :version, "1.4.0")
+    version = Keyword.get(opts, :version, Ecto.Adapters.Adbc.default_duckdb_version())
 
     # Ensure the driver is downloaded before attempting to use it
     ensure_driver_downloaded(driver, version)

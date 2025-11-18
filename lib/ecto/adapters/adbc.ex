@@ -6,7 +6,7 @@ defmodule Ecto.Adapters.Adbc do
 
     * `:database` - the path to the database or `:memory:` for in-memory database
     * `:driver` - ADBC driver to use (default: `:duckdb`)
-    * `:version` - DuckDB version (default: `"1.4.0"`)
+    * `:version` - DuckDB version (default: `#{@default_duckdb_version}`)
     * `:pool_size` - connection pool size (default: 5, must be 1 for `:memory:`)
 
   ## Type Configuration
@@ -36,6 +36,11 @@ defmodule Ecto.Adapters.Adbc do
   @behaviour Ecto.Adapter.Structure
 
   alias Ecto.Adapters.Adbc.{Codec, Connection}
+
+  @default_duckdb_version "1.4.2"
+
+  @doc false
+  def default_duckdb_version, do: @default_duckdb_version
 
   ## DuckLake Support
 
@@ -206,7 +211,7 @@ defmodule Ecto.Adapters.Adbc do
           # Create the database by connecting to it with ADBC directly
           # This will create a proper DuckDB database file
           driver = Keyword.get(opts, :driver, :duckdb)
-          version = Keyword.get(opts, :version, "1.4.1")
+          version = Keyword.get(opts, :version, @default_duckdb_version)
 
           # Ensure the driver is downloaded before attempting to use it
           ensure_driver_downloaded(driver, version)
