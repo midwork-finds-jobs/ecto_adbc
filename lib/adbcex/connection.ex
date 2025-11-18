@@ -16,9 +16,16 @@ defmodule Adbcex.Connection do
 
   @impl true
   def connect(opts) do
+    require Logger
+
     database = Keyword.get(opts, :database, ":memory:")
     driver = Keyword.get(opts, :driver, :duckdb)
     version = Keyword.get(opts, :version, Ecto.Adapters.Adbc.default_duckdb_version())
+
+    Logger.info("Adbcex.Connection.connect - database: #{inspect(database)}")
+    Logger.info("Adbcex.Connection.connect - driver: #{inspect(driver)}")
+    Logger.info("Adbcex.Connection.connect - version: #{inspect(version)}")
+    Logger.info("Adbcex.Connection.connect - driver is_binary?: #{inspect(is_binary(driver))}")
 
     # Ensure the driver is downloaded before attempting to use it
     # Skip download if driver is a string (path) - assume it's already available
@@ -29,6 +36,8 @@ defmodule Adbcex.Connection do
     # Start ADBC Database
     db_opts = [driver: driver, version: version]
     db_opts = if database != ":memory:", do: Keyword.put(db_opts, :path, database), else: db_opts
+
+    Logger.info("Adbcex.Connection.connect - db_opts being passed to Adbc.Database.start_link: #{inspect(db_opts)}")
 
     case Adbc.Database.start_link(db_opts) do
       {:ok, db} ->
